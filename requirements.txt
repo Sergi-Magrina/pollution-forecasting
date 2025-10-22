@@ -1,0 +1,10 @@
+pandas
+numpy
+matplotlib
+plotly
+scikit-learn
+statsmodels
+pmdarima
+prophet
+streamlit
+python-dateutil
