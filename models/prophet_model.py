@@ -45,15 +45,22 @@ class ProphetModel:
 
     def _future_df(self, y: pd.Series, steps: int) -> pd.DataFrame:
         df_hist = self._prep_df(y)
-        future = self.model_.make_future_dataframe(periods=steps, freq="D")
+        # Prophet's helper returns history + future; we only need the FUTURE rows
+        future_all = self.model_.make_future_dataframe(periods=steps, freq="D")
+        future_steps = future_all["ds"].tail(steps).reset_index(drop=True)
+
         if self.used_regs_:
-            # hold last known regressor values constant (simple, robust)
+            # Hold last known regressor values constant for the next H days
             last_vals = df_hist.iloc[-1:][self.used_regs_]
-            tail = pd.DataFrame(np.repeat(last_vals.values, steps, axis=0),
-                                columns=self.used_regs_)
-            tail.insert(0, "ds", future["ds"].values)
+            tail = pd.DataFrame(
+                np.repeat(last_vals.to_numpy(), steps, axis=0),
+                columns=self.used_regs_
+            )
+            tail.insert(0, "ds", future_steps)
             return tail[["ds"] + self.used_regs_]
-        return future
+
+        # No regressors: just return the future dates (H rows)
+        return pd.DataFrame({"ds": future_steps})
 
     def evaluate_and_forecast(self, y: pd.Series, H: int) -> ForecastResult:
         train, test = y.iloc[:-H], y.iloc[-H:]
