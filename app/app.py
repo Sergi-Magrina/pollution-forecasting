@@ -2,7 +2,7 @@ import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-    
+
 import os
 import numpy as np
 import pandas as pd
@@ -31,6 +31,7 @@ def load_clean_series():
     return s.asfreq("D")
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_daily_weather():
     raw_path = os.path.join("data", "BeijingPM20100101_20151231.csv")
     if not os.path.exists(raw_path):
@@ -44,11 +45,18 @@ def load_daily_weather():
     candidates = [c for c in ["TEMP", "DEWP", "PRES", "WSPM", "Iws"] if c in raw.columns]
     if not candidates:
         return None
+
     daily_weather = raw.resample("D")[candidates].mean().ffill().bfill()
     if "Iws" in daily_weather.columns and "WSPM" not in daily_weather.columns:
         daily_weather = daily_weather.rename(columns={"Iws": "WSPM"})
+
+    # Align to PM series index (important)
+    pm_index = load_clean_series().index
+    daily_weather = daily_weather.reindex(pm_index).ffill().bfill()
+
     keep = [c for c in ["TEMP", "DEWP", "PRES", "WSPM"] if c in daily_weather.columns]
     return daily_weather[keep]
+
 
 # ---------------------------------------------------
 # VISUALIZATION HELPERS
@@ -84,6 +92,45 @@ def plot_future(history: pd.Series, future_mean: pd.Series, low=None, high=None,
         ))
     fig.update_layout(height=420, title=title, xaxis_title="Date", yaxis_title="PM2.5 (µg/m³)")
     return fig
+
+# Cache the entire run so Prophet isn't refit on every rerun
+@st.cache_data(show_spinner=True)
+def run_model_cached(
+    model_name: str,
+    daily: pd.Series,
+    weather_df: pd.DataFrame | None,
+    H: int,
+    use_log: bool,
+    cps: float,
+    seasonal_mode: str,
+):
+    # Instantiate the model (classes you already have)
+    if model_name == "ARIMA (auto, non-seasonal)":
+        from models.arima_model import AutoARIMA
+        model = AutoARIMA(seasonal=False, m=1, use_log=use_log)
+    elif model_name == "SARIMA (weekly m=7)":
+        from models.arima_model import AutoARIMA
+        model = AutoARIMA(seasonal=True, m=7, use_log=use_log)
+    elif model_name == "Prophet (baseline)":
+        from models.prophet_model import ProphetModel
+        model = ProphetModel(cps=cps, seasonal_mode=seasonal_mode)
+    else:
+        from models.prophet_model import ProphetModel
+        model = ProphetModel(cps=cps, seasonal_mode=seasonal_mode, regressors=weather_df)
+
+    res = model.evaluate_and_forecast(daily, H)
+
+    # Return plain-serializable parts (so cache works smoothly)
+    out = {
+        "metrics": res.metrics,
+        "info": res.info,
+        "pred_test": res.pred_test.to_frame().reset_index().values.tolist(),
+        "future_mean": res.future_mean.to_frame().reset_index().values.tolist(),
+        "future_low": res.future_low.to_frame().reset_index().values.tolist() if res.future_low is not None else None,
+        "future_high": res.future_high.to_frame().reset_index().values.tolist() if res.future_high is not None else None,
+    }
+    return out
+
 
 # ---------------------------------------------------
 # SIDEBAR CONTROLS
@@ -124,54 +171,83 @@ st.plotly_chart(plot_series(daily, title="Daily PM2.5 (µg/m³)"), use_container
 # ---------------------------------------------------
 st.subheader("Model Fit & Evaluation")
 
-try:
-    # 1️⃣ Choose and instantiate model
-    if model_name == "ARIMA (auto, non-seasonal)":
-        model = AutoARIMA(seasonal=False, m=1, use_log=use_log)
-    elif model_name == "SARIMA (weekly m=7)":
-        model = AutoARIMA(seasonal=True, m=7, use_log=use_log)
-    elif model_name == "Prophet (baseline)":
-        model = ProphetModel(cps=cps, seasonal_mode=seasonal_mode)
-    else:
-        model = ProphetModel(cps=cps, seasonal_mode=seasonal_mode, regressors=weather_df)
+# ---------------------------------------------------
+# MODEL FITTING AND FORECASTING
+# ---------------------------------------------------
+st.subheader("Model Fit & Evaluation")
 
-    # 2️⃣ Evaluate on test and forecast future
-    res = model.evaluate_and_forecast(daily, H)
-
-    # 3️⃣ Display metrics
-    c1, c2, c3 = st.columns(3)
-    if res.metrics:
-        c1.metric("MAE", f"{res.metrics['MAE']:.1f}")
-        c2.metric("RMSE", f"{res.metrics['RMSE']:.1f}")
-        if res.metrics["MAPE"] == res.metrics["MAPE"]:
-            c3.metric("MAPE", f"{res.metrics['MAPE']:.1f}%")
+# Add a form so reruns don't auto-trigger heavy fits
+with st.form("run_form"):
+    cols = st.columns([1,1,1,2])
+    with cols[0]:
+        st.write(f"Model: **{model_name}**")
+    with cols[1]:
+        st.write(f"Horizon: **{H} days**")
+    with cols[2]:
+        if "Prophet" in model_name:
+            st.write(f"CPS: **{cps:.2f}**, Mode: **{seasonal_mode}**")
         else:
-            c3.metric("MAPE", "—")
+            st.write(f"ARIMA log1p: **{use_log}**")
+    run_clicked = st.form_submit_button("🚀 Run forecast")
 
-    st.caption(f"Model: {res.info}")
+if not run_clicked:
+    st.info("Set options in the sidebar and click **Run forecast**.")
+    st.stop()
 
-    # 4️⃣ Plot test window overlay
+try:
+    # Run (cached). Changing any input invalidates cache and recomputes once.
+    packed = run_model_cached(
+        model_name=model_name,
+        daily=daily,
+        weather_df=weather_df,
+        H=H,
+        use_log=use_log,
+        cps=float(cps),
+        seasonal_mode=seasonal_mode,
+    )
+
+    # Unpack cached payload back to Series for plotting
+    pred_test_df = pd.DataFrame(packed["pred_test"], columns=["datetime","forecast"]).set_index("datetime")
+    future_mean_df = pd.DataFrame(packed["future_mean"], columns=["datetime","forecast"]).set_index("datetime")
+    future_low_df = pd.DataFrame(packed["future_low"], columns=["datetime","yhat_lower"]).set_index("datetime") if packed["future_low"] else None
+    future_high_df = pd.DataFrame(packed["future_high"], columns=["datetime","yhat_upper"]).set_index("datetime") if packed["future_high"] else None
+
+    pred_test = pred_test_df["forecast"]
+    future_mean = future_mean_df["forecast"]
+    future_low = future_low_df["yhat_lower"] if future_low_df is not None else None
+    future_high = future_high_df["yhat_upper"] if future_high_df is not None else None
+
+    metrics = packed["metrics"] or {}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("MAE", f"{metrics.get('MAE', float('nan')):.1f}")
+    c2.metric("RMSE", f"{metrics.get('RMSE', float('nan')):.1f}")
+    mape_val = metrics.get("MAPE", float("nan"))
+    c3.metric("MAPE", f"{mape_val:.1f}%" if mape_val == mape_val else "—")
+
+    st.caption(f"Model: {packed['info']}")
+
+    # Plot test overlay
     st.plotly_chart(
-        plot_series(train, test, res.pred_test, title="Test Window — Actual vs Prediction"),
+        plot_series(train, test, pred_test, title="Test Window — Actual vs Prediction"),
         use_container_width=True
     )
 
-    # 5️⃣ Plot future forecast
+    # Future forecast plot
     st.subheader("Future Forecast")
     st.plotly_chart(
-        plot_future(daily, res.future_mean, low=res.future_low, high=res.future_high,
-                    title=f"Future {H}-day Forecast"),
+        plot_future(daily, future_mean, low=future_low, high=future_high, title=f"Future {H}-day Forecast"),
         use_container_width=True
     )
 
-    # 6️⃣ Download button
-    csv = res.future_mean.rename("forecast").to_frame().to_csv().encode("utf-8")
+    # Download
+    csv = future_mean.rename("forecast").to_frame().to_csv().encode("utf-8")
     st.download_button("⬇️ Download forecast CSV", csv,
-                       file_name=f"forecast_{model_name.replace(' ','_')}_{H}d.csv",
-                       mime="text/csv")
+        file_name=f"forecast_{model_name.replace(' ','_')}_{H}d.csv",
+        mime="text/csv")
 
 except Exception as e:
     st.error(f"Something went wrong while fitting {model_name}: {e}")
+
 
 st.markdown("---")
 st.caption("Try changing horizon, changepoint flexibility, or seasonality mode. Prophet + Weather often performs best.")

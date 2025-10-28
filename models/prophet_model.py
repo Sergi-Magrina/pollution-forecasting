@@ -9,17 +9,28 @@ class ProphetModel:
     def __init__(self, cps=0.2, seasonal_mode="additive", regressors: pd.DataFrame | None = None):
         self.cps = float(cps)
         self.seasonal_mode = seasonal_mode
-        self.regressors = regressors  # daily DataFrame indexed by datetime or None
+        self.regressors = regressors  # daily DataFrame indexed by datetime (same frequency as y)
         self.model_ = None
         self.used_regs_ = []
 
+    def _align_regressors(self, idx: pd.DatetimeIndex) -> pd.DataFrame | None:
+        """Return regressors aligned to idx (fill small gaps), or None if no regressors."""
+        if self.regressors is None:
+            return None
+        reg = self.regressors.copy()
+        reg.index = pd.to_datetime(reg.index)
+        reg = reg.reindex(idx).ffill().bfill()
+        return reg
+
     def _prep_df(self, y: pd.Series) -> pd.DataFrame:
-        df = y.rename("y").to_frame().reset_index().rename(columns={"datetime": "ds"})
-        if self.regressors is not None:
-            # join weather on the same daily index
-            reg = self.regressors.copy()
-            reg = reg.loc[~reg.index.duplicated(keep="last")]
-            df = df.set_index("ds").join(reg, how="left").reset_index()
+        """History frame for fitting: ds, y (+ aligned regressors if available)."""
+        y = y.copy()
+        y.index = pd.to_datetime(y.index)
+        df = y.rename("y").to_frame()
+        reg = self._align_regressors(y.index)
+        if reg is not None:
+            df = df.join(reg, how="left")
+        df = df.reset_index().rename(columns={"index": "ds", "datetime": "ds"})
         return df
 
     def fit(self, y: pd.Series):
@@ -43,33 +54,45 @@ class ProphetModel:
         self.model_ = m
         return self
 
-    def _future_df(self, y: pd.Series, steps: int) -> pd.DataFrame:
-        df_hist = self._prep_df(y)
-        # Prophet's helper returns history + future; we only need the FUTURE rows
+    def _future_known(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
+        """Build a frame for prediction on KNOWN future dates (e.g., test window) using real regressors."""
+        df = pd.DataFrame({"ds": pd.to_datetime(idx)})
+        if self.used_regs_:
+            reg = self._align_regressors(idx)
+            # reg has same index; attach the used regressor columns
+            for c in self.used_regs_:
+                df[c] = reg[c].values
+        return df
+
+    def _future_unknown(self, last_hist_idx: pd.DatetimeIndex, steps: int) -> pd.DataFrame:
+        """
+        Build a frame for prediction on UNKNOWN future (true forecast) dates:
+        use Prophet's future dates and hold regressors at their last known values.
+        """
         future_all = self.model_.make_future_dataframe(periods=steps, freq="D")
         future_steps = future_all["ds"].tail(steps).reset_index(drop=True)
-
+        df = pd.DataFrame({"ds": future_steps})
         if self.used_regs_:
-            # Hold last known regressor values constant for the next H days
-            last_vals = df_hist.iloc[-1:][self.used_regs_]
+            # last known values from the history end:
+            last_reg = self._align_regressors(last_hist_idx)[self.used_regs_].iloc[-1:]
             tail = pd.DataFrame(
-                np.repeat(last_vals.to_numpy(), steps, axis=0),
+                np.repeat(last_reg.to_numpy(), steps, axis=0),
                 columns=self.used_regs_
             )
-            tail.insert(0, "ds", future_steps)
-            return tail[["ds"] + self.used_regs_]
-
-        # No regressors: just return the future dates (H rows)
-        return pd.DataFrame({"ds": future_steps})
+            for c in self.used_regs_:
+                df[c] = tail[c].values
+        return df
 
     def evaluate_and_forecast(self, y: pd.Series, H: int) -> ForecastResult:
+        y = y.copy()
+        y.index = pd.to_datetime(y.index)
         train, test = y.iloc[:-H], y.iloc[-H:]
 
-        # test-window prediction
+        # --- test-window prediction using REAL regressors ---
         self.fit(train)
-        future_t = self._future_df(train, H)
+        future_t = self._future_known(test.index)  # real weather on test dates
         fcst_t = self.model_.predict(future_t)
-        pred_test = pd.Series(fcst_t.tail(H)["yhat"].values, index=test.index, name="forecast")
+        pred_test = pd.Series(fcst_t["yhat"].values, index=test.index, name="forecast")
 
         metrics = {
             "MAE": float(mean_absolute_error(test, pred_test)),
@@ -77,13 +100,15 @@ class ProphetModel:
             "MAPE": mape(test.values, pred_test.values),
         }
 
-        # future forecast from full history
+        # --- true future forecast using last-known regressors ---
         self.fit(y)
-        future_f = self._future_df(y, H)
-        fcst_f = self.model_.predict(future_f).tail(H).set_index("ds")
-        future_mean = fcst_f["yhat"].rename("forecast")
-        low = fcst_f.get("yhat_lower", None)
-        high = fcst_f.get("yhat_upper", None)
+        future_f = self._future_unknown(y.index, H)
+        fcst_f = self.model_.predict(future_f)
+        future_mean = pd.Series(fcst_f["yhat"].values,
+                                index=pd.date_range(y.index[-1] + pd.Timedelta(days=1), periods=H, freq="D"),
+                                name="forecast")
+        low = pd.Series(fcst_f["yhat_lower"].values, index=future_mean.index) if "yhat_lower" in fcst_f else None
+        high = pd.Series(fcst_f["yhat_upper"].values, index=future_mean.index) if "yhat_upper" in fcst_f else None
 
         info = f"Prophet(cps={self.cps}, mode={self.seasonal_mode})" \
                + (f" + regressors {self.used_regs_}" if self.used_regs_ else "")
