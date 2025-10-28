@@ -163,7 +163,7 @@ test = daily.iloc[-H:]
 # ---------------------------------------------------
 # HISTORICAL PLOT
 # ---------------------------------------------------
-st.title("🌫️ PM2.5 Forecasting Dashboard")
+st.title("PM2.5 Forecasting Dashboard")
 st.plotly_chart(plot_series(daily, title="Daily PM2.5 (µg/m³)"), use_container_width=True)
 
 # ---------------------------------------------------
