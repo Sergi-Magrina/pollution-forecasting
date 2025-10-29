@@ -171,11 +171,6 @@ st.plotly_chart(plot_series(daily, title="Daily PM2.5 (µg/m³)"), use_container
 # ---------------------------------------------------
 st.subheader("Model Fit & Evaluation")
 
-# ---------------------------------------------------
-# MODEL FITTING AND FORECASTING
-# ---------------------------------------------------
-st.subheader("Model Fit & Evaluation")
-
 # Add a form so reruns don't auto-trigger heavy fits
 with st.form("run_form"):
     cols = st.columns([1,1,1,2])
